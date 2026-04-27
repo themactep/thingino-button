@@ -38,6 +38,124 @@ Config configs[MAX_CONFIGS];
 int config_count = 0;
 char input_device[256] = DEFAULT_DEVICE;
 
+static void copy_string(char *dst, size_t dst_size, const char *src) {
+	if (dst_size == 0) {
+		return;
+	}
+
+	strncpy(dst, src, dst_size - 1);
+	dst[dst_size - 1] = '\0';
+}
+
+static void trim_newline(char *text) {
+	text[strcspn(text, "\r\n")] = '\0';
+}
+
+static int contains_case_insensitive(const char *haystack, const char *needle) {
+	size_t needle_len;
+
+	if (!haystack || !needle) {
+		return 0;
+	}
+
+	needle_len = strlen(needle);
+	if (needle_len == 0) {
+		return 1;
+	}
+
+	for (; *haystack; haystack++) {
+		size_t i;
+
+		for (i = 0; i < needle_len; i++) {
+			if (haystack[i] == '\0') {
+				return 0;
+			}
+			if (tolower((unsigned char)haystack[i]) != tolower((unsigned char)needle[i])) {
+				break;
+			}
+		}
+
+		if (i == needle_len) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int extract_event_device(const char *handlers, char *device, size_t device_size) {
+	const char *event;
+
+	for (event = strstr(handlers, "event"); event != NULL; event = strstr(event + 5, "event")) {
+		const char *end = event + 5;
+
+		while (isdigit((unsigned char)*end)) {
+			end++;
+		}
+
+		if (end > event + 5) {
+			snprintf(device, device_size, "/dev/input/%.*s", (int)(end - event), event);
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static int autodetect_gpio_keys_device(char *device, size_t device_size) {
+	FILE *file;
+	char line[512];
+	char name[256] = "";
+	char handlers[256] = "";
+
+	file = fopen("/proc/bus/input/devices", "r");
+	if (!file) {
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), file)) {
+		trim_newline(line);
+
+		if (line[0] == '\0') {
+			if ((contains_case_insensitive(name, "gpio-keys") ||
+				 contains_case_insensitive(name, "gpio keys") ||
+				 contains_case_insensitive(name, "gpio button")) &&
+				extract_event_device(handlers, device, device_size) == 0) {
+				fclose(file);
+				return 0;
+			}
+
+			name[0] = '\0';
+			handlers[0] = '\0';
+			continue;
+		}
+
+		if (strncmp(line, "N: Name=\"", 9) == 0) {
+			char *start = line + 9;
+			char *end = strrchr(start, '"');
+
+			if (end) {
+				*end = '\0';
+			}
+
+			copy_string(name, sizeof(name), start);
+		} else if (strncmp(line, "H: Handlers=", 12) == 0) {
+			copy_string(handlers, sizeof(handlers), line + 12);
+		}
+	}
+
+	fclose(file);
+
+	if ((contains_case_insensitive(name, "gpio-keys") ||
+		 contains_case_insensitive(name, "gpio keys") ||
+		 contains_case_insensitive(name, "gpio button")) &&
+		extract_event_device(handlers, device, device_size) == 0) {
+		return 0;
+	}
+
+	return -1;
+}
+
 // Global variables
 int silent_mode = 0;
 int daemon_mode = 0;
@@ -385,10 +503,29 @@ int main(int argc, char *argv[]) {
 		load_config();
 	}
 
+	if (strcmp(input_device, "auto") == 0 ||
+		strcmp(input_device, DEFAULT_DEVICE) == 0 ||
+		access(input_device, F_OK) != 0) {
+		char detected_device[sizeof(input_device)];
+
+		if (autodetect_gpio_keys_device(detected_device, sizeof(detected_device)) == 0) {
+			copy_string(input_device, sizeof(input_device), detected_device);
+			log_message("Using auto-detected GPIO keys input device: %s\n", input_device);
+		}
+	}
+
 	// Register signal handlers
 	signal(SIGTERM, handle_signal);
 
-	int fd = open(input_device, O_RDONLY | O_NONBLOCK);
+	int fd = -1;
+	int retries = 0;
+	while (fd < 0 && retries < 30) {
+		fd = open(input_device, O_RDONLY | O_NONBLOCK);
+		if (fd < 0) {
+			retries++;
+			sleep(1);
+		}
+	}
 	if (fd < 0) {
 		perror("Failed to open event device");
 		return 1;
